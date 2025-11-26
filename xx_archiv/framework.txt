@@ -1,0 +1,86 @@
+project/
+│
+├── app.py                # Main Dash app
+├── layout.py             # Assembles the layout using components from /panels
+├── callbacks.py          # Registers callbacks that update panels
+├── data/
+│   ├── rest_client.py    # Functions to call REST endpoints
+│   ├── ws_client.py      # Websocket connection logic
+│   ├── data_manager.py   # Shared state, caching, or data store
+│
+├── panels/
+│   ├── __init__.py
+│   ├── panel_1.py        # Code for plot/panel 1
+│   ├── panel_2.py        # Code for plot/panel 2
+│   └── panel_3.py        # Code for plot/panel 3
+│
+└── assets/               # CSS, JS
+
+
+
+panels/panel_1.py --------------
+import plotly.graph_objects as go
+from dash import html, dcc
+
+def layout():
+    return html.Div([
+        html.H3("Temperature Over Time"),
+        dcc.Graph(id="temp_plot")
+    ])
+
+def make_figure(data):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data["time"], y=data["temp"]))
+    return fig
+
+layout.py --------------
+from dash import html
+from panels import panel_1, panel_2, panel_3
+
+def serve_layout():
+    return html.Div([
+        panel_1.layout(),
+        panel_2.layout(),
+        panel_3.layout(),
+    ])
+
+callbacks.py --------------
+from dash.dependencies import Input, Output
+from panels import panel_1
+from data.data_manager import get_latest_data
+
+def register_callbacks(app):
+
+    @app.callback(
+        Output("temp_plot", "figure"),
+        Input("interval-component", "n_intervals")
+    )
+    def update_temp_plot(_):
+        data = get_latest_data("temperature")
+        return panel_1.make_figure(data)
+
+data/data_manager.py --------------
+import threading
+
+DATA = {
+    "temperature": None,
+    "pressure": None,
+}
+
+def update_from_ws(message):
+    DATA["temperature"] = message["temperature"]
+
+def get_latest_data(key):
+    return DATA[key]
+
+app.py --------------
+from dash import Dash
+import layout
+import callbacks
+
+app = Dash(__name__)
+app.layout = layout.serve_layout()
+callbacks.register_callbacks(app)
+
+if __name__ == "__main__":
+    app.run_server(debug=True)
