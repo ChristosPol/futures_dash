@@ -1,56 +1,108 @@
-/* --------------------------
+/* ============================================================
+   ROOT FIXES (DO NOT REMOVE)
+   ============================================================ */
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #111;
+}
+
+
+/* ============================================================
    3×3 GRID LAYOUT
--------------------------- */
+   ============================================================ */
 #grid-container {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);  /* 3 equal-width columns */
-    grid-template-rows: repeat(3, auto);    /* 3 auto-height rows   */
-    gap: 20px;
-    padding: 20px;
-    background: green;
-    min-height: 100vh;
+    grid-template-columns: repeat(3, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+
+    height: 100vh;
+    width: 100vw;
+
+    gap: 6px;
+    padding: 6px;
+    box-sizing: border-box;
 }
 
-/* --------------------------
-   PANEL STYLE
--------------------------- */
+
+/* ============================================================
+   PANEL CONTAINER
+   ============================================================ */
 .panel {
     background: black;
-    padding: 20px;
-    border-radius: 12px;
-    box-shadow: 0 3px 7px rgba(22, 5, 5, 0.8);
-    border: 1px solid #ddd;
-    color: white; /* default text color inside panel */
+    border: 1px solid #444;
+    border-radius: 8px;
+    box-shadow: 0 0 4px rgba(255, 255, 255, 0.1);
+    color: white;
 
+    display: flex;
+    flex-direction: column;
+
+    overflow: hidden;
+
+    /* CRITICAL: allows Plotly to stop growing infinitely */
+    min-height: 0;
 }
 
-/* --------------------------
-   INDIVIDUAL POSITIONS (optional)
--------------------------- */
-.p1 { grid-column: 1; grid-row: 1; }
-.p2 { grid-column: 2; grid-row: 1; }
-.p3 { grid-column: 3; grid-row: 1; }
 
-.p4 { grid-column: 1; grid-row: 2; }
-.p5 { grid-column: 2; grid-row: 2; }
-.p6 { grid-column: 3; grid-row: 2; }
+/* ============================================================
+   PANEL TITLE
+   ============================================================ */
+.panel-title {
+    padding: 8px 10px;
+    font-size: 16px;
+    font-weight: bold;
+    color: white;
+    flex: 0 0 auto;
+    border-bottom: 1px solid #333;
+}
 
-.p7 { grid-column: 1; grid-row: 3; }
-.p8 { grid-column: 2; grid-row: 3; }
-.p9 { grid-column: 3; grid-row: 3; }
 
-/* --------------------------
-   RESPONSIVE MODE
-   Stack panels on smaller screens
--------------------------- */
+/* ============================================================
+   GRAPH AREA (Plotly MUST live here)
+   ============================================================ */
+.panel-graph {
+    flex: 1 1 auto;
+    width: 100%;
+    height: 100%;
+
+    /* CRITICAL: required for proper flex behavior */
+    min-height: 0;
+    min-width: 0;
+
+    overflow: hidden;
+}
+
+
+/* ============================================================
+   INTERNAL PLOTLY ENGINES (do NOT remove)
+   ============================================================ */
+.panel-graph .js-plotly-plot,
+.panel-graph .plot-container,
+.panel-graph .svg-container {
+    width: 100% !important;
+    height: 100% !important;
+
+    min-height: 0 !important;
+    min-width: 0 !important;
+
+    overflow: hidden !important;
+}
+
+
+/* ============================================================
+   RESPONSIVE BREAKPOINTS
+   ============================================================ */
 @media (max-width: 1100px) {
     #grid-container {
-        grid-template-columns: 1fr 1fr; /* 2 columns */
+        grid-template-columns: repeat(2, 1fr);
     }
 }
 
 @media (max-width: 700px) {
     #grid-container {
-        grid-template-columns: 1fr; /* 1 column */
+        grid-template-columns: 1fr;
     }
 }
