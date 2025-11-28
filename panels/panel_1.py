@@ -6,7 +6,7 @@ from data.indicators import add_all_smas
 
 
 def make_figure():
-    df = get_ohlc(pair="XXBTZUSD", interval=60)
+    df = get_ohlc(pair="SOLUSD", interval=1440)
     df = add_all_smas(df)
 
     fig = go.Figure()

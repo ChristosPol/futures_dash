@@ -3,7 +3,7 @@ import pandas as pd
 
 KRAKEN_URL = "https://api.kraken.com/0/public/OHLC"
 
-def get_ohlc(pair="XXBTZUSD", interval=60):
+def get_ohlc(pair="SOLUSD", interval=1440):
     """
     Fetch OHLC data from Kraken REST API.
     interval example: 1 = 1 min, 60 = 1 hour, 1440 = daily.
