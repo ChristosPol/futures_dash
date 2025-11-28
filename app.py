@@ -5,9 +5,11 @@ import callbacks
 
 app = Dash(__name__)
 app.layout = layout.serve_layout()
+
+# Register app callbacks
 callbacks.register_callbacks(app)
 
-# ---- start websocket feed before the server starts
+# Start websocket listener
 start_ws_thread()
 
 if __name__ == "__main__":
