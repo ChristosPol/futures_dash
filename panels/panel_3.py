@@ -3,7 +3,7 @@ from dash import html, dcc
 
 def layout():
     return html.Div([
-        html.H1("Panel 3")
+        html.H1("Panel 4")
     ])
 '''
 def make_figure(data):
