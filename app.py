@@ -2,6 +2,8 @@ from dash import Dash
 import layout
 from data.ws_client import start_ws_thread
 import callbacks
+import plotly.io as pio
+pio.templates.default = "plotly_dark"
 
 app = Dash(__name__)
 app.layout = layout.serve_layout()

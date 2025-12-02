@@ -7,13 +7,22 @@ import datetime
 
 def layout():
     return html.Div(
-        [
-            html.H3("Buy/Sell Volume per Hour (Last 24h) — PF_SOLUSD"),
+        className="panel",
+        children=[
+            # Title
+            html.Div(
+                "Buy/Sell Volume per Hour (Last 24h) — PF_SOLUSD",
+                className="panel-title"
+            ),
 
-            dcc.Graph(
-                id="panel2-volume-bars",
-                config={"displayModeBar": False},
-                style={"height": "350px"}
+            # Graph wrapper (CRITICAL for correct sizing)
+            html.Div(
+                dcc.Graph(
+                    id="panel2-volume-bars",
+                    config={"displayModeBar": False},
+                    style={"width": "100%", "height": "100%"}
+                ),
+                className="panel-graph"
             ),
 
             dcc.Interval(
@@ -21,8 +30,7 @@ def layout():
                 interval=2000,   # update every 2 seconds
                 n_intervals=0
             )
-        ],
-        className="panel"
+        ]
     )
 
 
@@ -86,7 +94,7 @@ def register_callbacks(app):
             marker_color="red"
         ))
 
-        # ----- Add TOTAL VOLUME + TOTAL COST annotations -----
+        # ----- Add TOTAL VOLUME + COST annotations -----
         for i, hour in enumerate(hour_labels):
             label = f"{totals[i]:.2f}  ({costs[i]:,.0f})"
 
@@ -106,8 +114,6 @@ def register_callbacks(app):
             margin=dict(l=30, r=30, t=40, b=40),
             xaxis_title="Hour",
             yaxis_title="Volume",
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
