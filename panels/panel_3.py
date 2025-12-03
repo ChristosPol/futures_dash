@@ -2,7 +2,9 @@
 import plotly.graph_objects as go
 from dash import html, dcc, Input, Output
 
-import data.ws_client as ws     # <-- IMPORTANT FIX
+import data.ws_client as ws
+
+MAX_BUCKETS_AROUND = 10
 
 
 def layout():
@@ -13,7 +15,6 @@ def layout():
                 "Live Buy/Sell Volume by Price Bucket (0.50 USD) — PF_SOLUSD",
                 className="panel-title"
             ),
-
             html.Div(
                 dcc.Graph(
                     id="panel3-histogram",
@@ -22,12 +23,7 @@ def layout():
                 ),
                 className="panel-graph"
             ),
-
-            dcc.Interval(
-                id="panel3-interval",
-                interval=2000,
-                n_intervals=0
-            )
+            dcc.Interval(id="panel3-interval", interval=2000, n_intervals=0)
         ]
     )
 
@@ -41,67 +37,97 @@ def register_callbacks(app):
     def update_hist(_):
 
         if not ws.PRICE_BUCKETS:
-            fig = go.Figure()
-            fig.update_layout(
-                template="plotly_dark",
-                title="Waiting for trade data...",
-                xaxis={"visible": False},
-                yaxis={"visible": False}
-            )
-            return fig
+            return go.Figure().update_layout(template="plotly_dark")
 
-        buckets = sorted(ws.PRICE_BUCKETS.keys())
+        # Determine bucket window
+        center = ws.LAST_PRICE or sorted(ws.PRICE_BUCKETS.keys())[0]
+        all_buckets = sorted(ws.PRICE_BUCKETS.keys())
+        min_b = center - MAX_BUCKETS_AROUND * ws.BUCKET_SIZE
+        max_b = center + MAX_BUCKETS_AROUND * ws.BUCKET_SIZE
+        buckets = [b for b in all_buckets if min_b <= b <= max_b]
+
         buy_vol = [ws.PRICE_BUCKETS[b]["buy"] for b in buckets]
         sell_vol = [ws.PRICE_BUCKETS[b]["sell"] for b in buckets]
         labels = [f"{b:.2f}" for b in buckets]
 
-        line_widths = [
-            (3 if b == ws.LAST_BUCKET else 0)
-            for b in buckets
-        ]
-        line_colors = [
-            ("deepskyblue" if b == ws.LAST_BUCKET else "rgba(0,0,0,0)")
-            for b in buckets
-        ]
-
         fig = go.Figure()
 
+        # =========================================================
+        # 🔥 Neon Glow Pulse Layer
+        # =========================================================
+        if ws.FLASH_BUCKET in buckets:
+            idx = buckets.index(ws.FLASH_BUCKET)
+            pulse_alpha = ws.FLASH_STRENGTH
+            ws.FLASH_STRENGTH *= ws.FLASH_DECAY
+
+            if pulse_alpha > 0.05:
+                fig.add_shape(
+                    type="rect",
+                    x0=-max(sell_vol) * 1.2,
+                    x1=max(buy_vol) * 1.2,
+                    y0=idx - 0.5,
+                    y1=idx + 0.5,
+                    line=dict(
+                        color=f"rgba(0,200,255,{pulse_alpha})",
+                        width=8
+                    ),
+                    layer="below"
+                )
+
+        # =========================================================
+        # 📊 BUY bars (inside text)
+        # =========================================================
         fig.add_trace(go.Bar(
             y=labels,
             x=buy_vol,
             name="Buys",
             marker_color="green",
             orientation="h",
-            marker_line_width=line_widths,
-            marker_line_color=line_colors,
+            text=[f"{v:.2f}" for v in buy_vol],
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="white", size=14),
         ))
 
+        # =========================================================
+        # 📊 SELL bars (inside text)
+        # =========================================================
         fig.add_trace(go.Bar(
             y=labels,
             x=[-v for v in sell_vol],
             name="Sells",
             marker_color="red",
             orientation="h",
-            marker_line_width=line_widths,
-            marker_line_color=line_colors,
+            text=[f"{v:.2f}" for v in sell_vol],
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="white", size=14),
         ))
 
+        # =========================================================
+        # Layout
+        # =========================================================
         fig.update_layout(
             template="plotly_dark",
+            margin=dict(l=80, r=40, t=40, b=40),
             barmode="relative",
-            margin=dict(l=60, r=40, t=80, b=40),
             xaxis_title="Volume",
-            yaxis_title=f"Price Bucket (size = {ws.BUCKET_SIZE})"
+            yaxis_title=f"Buckets (size = {ws.BUCKET_SIZE})",
+            showlegend=True,
         )
 
-        # --- Current price text ---
-        if ws.LAST_PRICE is not None:
+        # =========================================================
+        # 💬 Current Price Annotation
+        # =========================================================
+        if ws.LAST_PRICE:
             fig.add_annotation(
-                text=f"Current Price: <b>{ws.LAST_PRICE:.2f}</b>",
+                text=f"Price {ws.LAST_PRICE:.2f}",
                 xref="paper", yref="paper",
-                x=1, y=1.15,
+                x=0.98,
+                y=1.05,
                 showarrow=False,
-                font=dict(size=18, color="deepskyblue")
+                font=dict(size=14, color="deepskyblue", family="Arial"),
+                align="right"
             )
 
         return fig
