@@ -16,46 +16,48 @@ WS_RUNNING = False
 
 # ---- Panel 3 bucket engine ----
 PRICE_BUCKETS = {}         # { bucket_price : { "buy": vol, "sell": vol } }
-BUCKET_SIZE = 0.50         # bucket step
+BUCKET_SIZE = 0.50
 
 LAST_BUCKET = None         # last bucket that received a trade
 LAST_PRICE = None          # last trade price
+LAST_SIDE = None           # side of last trade
 
 # ---- Flash Pulse Effect ----
 FLASH_BUCKET = None
 FLASH_STRENGTH = 1.0
-FLASH_DECAY = 0.85         # neon fade speed
+FLASH_DECAY = 0.85
 
 # ---- Panels 4,5,6 ----
-CVD = 0.0                  # cumulative delta
-LAST_TRADES = []           # store last 10 trades
-TRADE_TIMESTAMPS = []      # for velocity
-
-
-def get_latest(symbol):
-    return LATEST_DATA.get(symbol, {})
+CVD = 0.0
+LAST_TRADES = []           # last 10 trades
+TRADE_TIMESTAMPS = []      # trade velocity timestamps
 
 
 # ============================================================
 # HELPERS
 # ============================================================
 
+def get_latest(symbol):
+    return LATEST_DATA.get(symbol, {})
+
+
 def _bucket_from_price(price: float) -> float:
-    """Compute 0.50 bucket from price."""
+    """Compute bucket rounded to BUCKET_SIZE (default 0.50)."""
     return round(price / BUCKET_SIZE) * BUCKET_SIZE
 
 
 def _update_price_bucket(price: float, volume: float, side: str):
     """
     Update bucket volumes & last trade state.
-    Trigger flash pulse. Update tape + CVD + timestamps.
+    Includes: Flash pulse, CVD, tape, velocity.
     """
-    global LAST_BUCKET, LAST_PRICE
+    global LAST_BUCKET, LAST_PRICE, LAST_SIDE
     global FLASH_BUCKET, FLASH_STRENGTH
     global CVD, LAST_TRADES, TRADE_TIMESTAMPS
 
     bucket = _bucket_from_price(price)
 
+    # Create bucket entry if missing
     if bucket not in PRICE_BUCKETS:
         PRICE_BUCKETS[bucket] = {"buy": 0.0, "sell": 0.0}
 
@@ -64,19 +66,24 @@ def _update_price_bucket(price: float, volume: float, side: str):
 
     PRICE_BUCKETS[bucket][side] += volume
 
-    # ---- Last trade ----
+    # Store last-trade attributes
     LAST_BUCKET = bucket
     LAST_PRICE = price
+    LAST_SIDE = side
 
-    # ---- Flash pulse trigger ----
+    # Flash pulse activate
     FLASH_BUCKET = bucket
     FLASH_STRENGTH = 1.0
 
-    # ---- CVD update ----
+    # ------------------------
+    # CVD update
+    # ------------------------
     delta = volume if side == "buy" else -volume
     CVD += delta
 
-    # ---- Last 10 trades storage ----
+    # ------------------------
+    # Last 10 trades storage
+    # ------------------------
     trade_record = {
         "price": price,
         "volume": volume,
@@ -84,14 +91,16 @@ def _update_price_bucket(price: float, volume: float, side: str):
         "time": time.time()
     }
     LAST_TRADES.append(trade_record)
-    LAST_TRADES = LAST_TRADES[-10:]  # keep only last 10
+    LAST_TRADES = LAST_TRADES[-10:]  # keep newest 10
 
-    # ---- For velocity ----
+    # ------------------------
+    # Trade velocity timestamp
+    # ------------------------
     TRADE_TIMESTAMPS.append(time.time())
 
 
 def _decay_flash():
-    """Decay flash over time."""
+    """Fade out the neon pulse highlight."""
     global FLASH_STRENGTH, FLASH_BUCKET
 
     if FLASH_BUCKET is not None:
@@ -101,92 +110,108 @@ def _decay_flash():
 
 
 # ============================================================
-# MAIN ASYNC WEBSOCKET LOOP
+# MAIN WEBSOCKET LOOP (STABLE VERSION)
 # ============================================================
 
 async def _ws_loop():
+    """
+    Stable Kraken Futures WebSocket loop.
+    Uses a reconnecting outer loop to prevent recursion.
+    Only one WS loop runs at a time.
+    """
     global WS_RUNNING
 
     url = "wss://futures.kraken.com/ws/v1"
-    print("WebSocket: Connecting...")
 
-    try:
-        async with websockets.connect(url, ping_interval=None) as ws:
+    while True:  # Reconnect loop
+        print("WebSocket: Connecting...")
 
-            # Subscribe to PF_SOLUSD ticker + trades
-            await ws.send(json.dumps({
-                "event": "subscribe",
-                "feed": "ticker",
-                "product_ids": ["PF_SOLUSD"]
-            }))
+        try:
+            async with websockets.connect(url, ping_interval=None) as ws:
 
-            await ws.send(json.dumps({
-                "event": "subscribe",
-                "feed": "trade",
-                "product_ids": ["PF_SOLUSD"]
-            }))
+                # Subscribe feeds
+                await ws.send(json.dumps({
+                    "event": "subscribe",
+                    "feed": "ticker",
+                    "product_ids": ["PF_SOLUSD"]
+                }))
 
-            WS_RUNNING = True
-            print("WebSocket: Connected.")
+                await ws.send(json.dumps({
+                    "event": "subscribe",
+                    "feed": "trade",
+                    "product_ids": ["PF_SOLUSD"]
+                }))
 
-            while True:
-                try:
-                    msg = await asyncio.wait_for(ws.recv(), timeout=5)
-                except asyncio.TimeoutError:
-                    await ws.ping()
-                    continue
+                WS_RUNNING = True
+                print("WebSocket: Connected.")
 
-                data = json.loads(msg)
-
-                # ---- Ticker feed ----
-                if data.get("feed") == "ticker" and "product_id" in data:
-                    LATEST_DATA[data["product_id"]] = data
-                    _decay_flash()
-                    continue
-
-                # ---- Trade feed ----
-                if data.get("feed") == "trade":
-
-                    # FUTURES single-trade format
-                    if "qty" in data and "price" in data:
-                        try:
-                            price = float(data["price"])
-                            volume = float(data["qty"])
-                            side = data.get("side", "buy")
-                            ts_ms = data.get("time")
-                            ts = ts_ms / 1000 if ts_ms else time.time()
-
-                            add_trade(price, volume, side, ts)
-                            _update_price_bucket(price, volume, side)
-                            _decay_flash()
-
-                        except Exception as e:
-                            print("Trade parse error:", e)
-
+                # ---------- MESSAGE LOOP ----------
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        # Keep alive
+                        await ws.ping()
                         continue
 
-                    # SPOT multi-trade fallback
-                    if "trades" in data:
-                        for t in data["trades"]:
+                    data = json.loads(msg)
+
+                    # -----------------------------
+                    # TICKER FEED
+                    # -----------------------------
+                    if data.get("feed") == "ticker" and "product_id" in data:
+                        LATEST_DATA[data["product_id"]] = data
+                        _decay_flash()
+                        continue
+
+                    # -----------------------------
+                    # FUTURES TRADE FEED
+                    # -----------------------------
+                    if data.get("feed") == "trade":
+
+                        # Futures single-trade format
+                        if "price" in data and "qty" in data:
                             try:
-                                price = float(t["price"])
-                                volume = float(t["qty"])
-                                side = t.get("side", "buy")
-                                ts = t.get("timestamp", time.time())
+                                price = float(data["price"])
+                                volume = float(data["qty"])
+                                side = data.get("side", "buy")
+
+                                ts_ms = data.get("time")
+                                ts = ts_ms / 1000 if ts_ms else time.time()
 
                                 add_trade(price, volume, side, ts)
                                 _update_price_bucket(price, volume, side)
-                                _decay_flash()
 
                             except Exception as e:
                                 print("Trade parse error:", e)
-                        continue
 
-    except Exception as e:
-        print("WebSocket error:", e)
-        WS_RUNNING = False
-        time.sleep(3)
-        return await _ws_loop()
+                            _decay_flash()
+                            continue
+
+                        # Spot multi-trade fallback
+                        if "trades" in data:
+                            for t in data["trades"]:
+                                try:
+                                    price = float(t["price"])
+                                    volume = float(t["qty"])
+                                    side = t.get("side", "buy")
+                                    ts = t.get("timestamp", time.time())
+
+                                    add_trade(price, volume, side, ts)
+                                    _update_price_bucket(price, volume, side)
+
+                                except Exception as e:
+                                    print("Trade parse error:", e)
+
+                            _decay_flash()
+                            continue
+
+        except Exception as e:
+            print("WEBSOCKET ERROR:", e)
+            WS_RUNNING = False
+
+        print("Reconnecting in 2 seconds...")
+        await asyncio.sleep(2)
 
 
 # ============================================================
@@ -194,7 +219,10 @@ async def _ws_loop():
 # ============================================================
 
 def start_ws_thread():
-    """Run WebSocket loop in its own thread."""
+    """
+    Launch WebSocket loop in a background thread.
+    Ensures only one WS thread exists.
+    """
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

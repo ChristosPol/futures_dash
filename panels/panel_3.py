@@ -1,10 +1,10 @@
 # panels/panel_3.py
 import plotly.graph_objects as go
 from dash import html, dcc, Input, Output
-
 import data.ws_client as ws
 
 MAX_BUCKETS_AROUND = 10
+DECAY_FACTOR = 0.98
 
 
 def layout():
@@ -12,7 +12,7 @@ def layout():
         className="panel",
         children=[
             html.Div(
-                "Live Buy/Sell Volume by Price Bucket (0.50 USD) — PF_SOLUSD",
+                id="panel3-title",
                 className="panel-title"
             ),
             html.Div(
@@ -23,7 +23,7 @@ def layout():
                 ),
                 className="panel-graph"
             ),
-            dcc.Interval(id="panel3-interval", interval=2000, n_intervals=0)
+            dcc.Interval(id="panel3-interval", interval=1800, n_intervals=0)
         ]
     )
 
@@ -32,102 +32,145 @@ def register_callbacks(app):
 
     @app.callback(
         Output("panel3-histogram", "figure"),
+        Output("panel3-title", "children"),
         Input("panel3-interval", "n_intervals")
     )
     def update_hist(_):
 
-        if not ws.PRICE_BUCKETS:
-            return go.Figure().update_layout(template="plotly_dark")
+        # ----------------------------------------------------
+        # Fade bucket volumes slightly (decay effect)
+        # ----------------------------------------------------
+        for b in list(ws.PRICE_BUCKETS.keys()):
+            ws.PRICE_BUCKETS[b]["buy"] *= DECAY_FACTOR
+            ws.PRICE_BUCKETS[b]["sell"] *= DECAY_FACTOR
 
-        # Determine bucket window
+        if not ws.PRICE_BUCKETS:
+            fig = go.Figure().update_layout(template="plotly_dark")
+            return fig, "Live Buy/Sell Volume by Price Bucket (0.50 USD)"
+
+        # ----------------------------------------------------
+        # Determine visible bucket window around last price
+        # ----------------------------------------------------
         center = ws.LAST_PRICE or sorted(ws.PRICE_BUCKETS.keys())[0]
         all_buckets = sorted(ws.PRICE_BUCKETS.keys())
+
         min_b = center - MAX_BUCKETS_AROUND * ws.BUCKET_SIZE
         max_b = center + MAX_BUCKETS_AROUND * ws.BUCKET_SIZE
+
         buckets = [b for b in all_buckets if min_b <= b <= max_b]
 
         buy_vol = [ws.PRICE_BUCKETS[b]["buy"] for b in buckets]
         sell_vol = [ws.PRICE_BUCKETS[b]["sell"] for b in buckets]
         labels = [f"{b:.2f}" for b in buckets]
 
+        # ----------------------------------------------------
+        # Build figure
+        # ----------------------------------------------------
         fig = go.Figure()
 
-        # =========================================================
-        # 🔥 Neon Glow Pulse Layer
-        # =========================================================
-        if ws.FLASH_BUCKET in buckets:
-            idx = buckets.index(ws.FLASH_BUCKET)
-            pulse_alpha = ws.FLASH_STRENGTH
-            ws.FLASH_STRENGTH *= ws.FLASH_DECAY
+        # For shape boundaries
+        max_buy = max(buy_vol) if buy_vol else 1
+        max_sell = max(sell_vol) if sell_vol else 1
+        min_x = -max_sell * 1.15
+        max_x = max_buy * 1.15
 
-            if pulse_alpha > 0.05:
-                fig.add_shape(
+        # ----------------------------------------------------
+        # TRUE ABSORPTION DETECTION (Option A)
+        # ----------------------------------------------------
+        absorption_shapes = []
+
+        for i, b in enumerate(buckets):
+
+            buy_v = ws.PRICE_BUCKETS[b]["buy"]
+            sell_v = ws.PRICE_BUCKETS[b]["sell"]
+
+            # Noise filter threshold
+            thresh = max(buy_v + sell_v, 1) * 0.25
+
+            # --------------------------------------
+            # 🟦 BULLISH ABSORPTION
+            # Aggressive sellers fail to move price down
+            # --------------------------------------
+            if sell_v > thresh and ws.LAST_PRICE and ws.LAST_PRICE > b:
+                absorption_shapes.append(dict(
                     type="rect",
-                    x0=-max(sell_vol) * 1.2,
-                    x1=max(buy_vol) * 1.2,
-                    y0=idx - 0.5,
-                    y1=idx + 0.5,
-                    line=dict(
-                        color=f"rgba(0,200,255,{pulse_alpha})",
-                        width=8
-                    ),
-                    layer="below"
-                )
+                    x0=min_x,
+                    x1=max_x,
+                    y0=i - 0.45,
+                    y1=i + 0.45,
+                    line=dict(color="rgba(0,140,255,1.0)", width=3),
+                    fillcolor="rgba(0,0,0,0)"
+                ))
 
-        # =========================================================
-        # 📊 BUY bars (inside text)
-        # =========================================================
+            # --------------------------------------
+            # 🟧 BEARISH ABSORPTION
+            # Aggressive buyers fail to move price up
+            # --------------------------------------
+            if buy_v > thresh and ws.LAST_PRICE and ws.LAST_PRICE < b:
+                absorption_shapes.append(dict(
+                    type="rect",
+                    x0=min_x,
+                    x1=max_x,
+                    y0=i - 0.45,
+                    y1=i + 0.45,
+                    line=dict(color="rgba(255,140,0,1.0)", width=3),
+                    fillcolor="rgba(0,0,0,0)"
+                ))
+
+        # Apply absorption shapes
+        for shape in absorption_shapes:
+            fig.add_shape(shape)
+
+        # ----------------------------------------------------
+        # BUY bars
+        # ----------------------------------------------------
         fig.add_trace(go.Bar(
             y=labels,
             x=buy_vol,
             name="Buys",
             marker_color="green",
             orientation="h",
-            text=[f"{v:.2f}" for v in buy_vol],
+            text=[f"{v:,.2f}" for v in buy_vol],
             textposition="inside",
             insidetextanchor="middle",
-            textfont=dict(color="white", size=14),
+            hovertemplate="Buy Volume: %{x:,.2f}<extra></extra>"
         ))
 
-        # =========================================================
-        # 📊 SELL bars (inside text)
-        # =========================================================
+        # ----------------------------------------------------
+        # SELL bars
+        # ----------------------------------------------------
         fig.add_trace(go.Bar(
             y=labels,
             x=[-v for v in sell_vol],
             name="Sells",
             marker_color="red",
             orientation="h",
-            text=[f"{v:.2f}" for v in sell_vol],
+            text=[f"{v:,.2f}" for v in sell_vol],
             textposition="inside",
             insidetextanchor="middle",
-            textfont=dict(color="white", size=14),
+            hovertemplate="Sell Volume: %{x:,.2f}<extra></extra>"
         ))
 
-        # =========================================================
+        # ----------------------------------------------------
         # Layout
-        # =========================================================
+        # ----------------------------------------------------
         fig.update_layout(
             template="plotly_dark",
-            margin=dict(l=80, r=40, t=40, b=40),
+            margin=dict(l=60, r=30, t=40, b=40),
             barmode="relative",
             xaxis_title="Volume",
             yaxis_title=f"Buckets (size = {ws.BUCKET_SIZE})",
-            showlegend=True,
+            xaxis=dict(range=[min_x, max_x]),
+            showlegend=False
         )
 
-        # =========================================================
-        # 💬 Current Price Annotation
-        # =========================================================
+        # ----------------------------------------------------
+        # Title with current price
+        # ----------------------------------------------------
+        title_text = (
+            f"Live Buy/Sell Volume by Price Bucket (0.50 USD) — PF_SOLUSD"
+        )
         if ws.LAST_PRICE:
-            fig.add_annotation(
-                text=f"Price {ws.LAST_PRICE:.2f}",
-                xref="paper", yref="paper",
-                x=0.98,
-                y=1.05,
-                showarrow=False,
-                font=dict(size=14, color="deepskyblue", family="Arial"),
-                align="right"
-            )
+            title_text += f" — Price {ws.LAST_PRICE:.2f}"
 
-        return fig
+        return fig, title_text
