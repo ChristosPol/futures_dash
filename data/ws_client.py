@@ -29,8 +29,16 @@ FLASH_DECAY = 0.85
 
 # ---- Panels 4,5,6 ----
 CVD = 0.0
-LAST_TRADES = []           # last 10 trades
-TRADE_TIMESTAMPS = []      # trade velocity timestamps
+LAST_TRADES = []                # last 10 trades
+
+# Velocity tracking
+TRADE_TIMESTAMPS = []           # for TPS
+BUY_TIMESTAMPS = []             # (timestamp, volume)
+SELL_TIMESTAMPS = []            # (timestamp, volume)
+
+# ---- Panel 7: Micro-momentum tracking ----
+PREV_TRADE_PRICE = None
+PRICE_DISPLACEMENT = []         # list of (timestamp, ΔPrice)
 
 
 # ============================================================
@@ -48,16 +56,24 @@ def _bucket_from_price(price: float) -> float:
 
 def _update_price_bucket(price: float, volume: float, side: str):
     """
-    Update bucket volumes & last trade state.
-    Includes: Flash pulse, CVD, tape, velocity.
+    Update all internal engines:
+    - Bucket volume
+    - Last trade info
+    - Flash pulse
+    - CVD
+    - Last trades tape
+    - Volume velocity
+    - Micro-momentum (ΔPrice per trade)
     """
     global LAST_BUCKET, LAST_PRICE, LAST_SIDE
     global FLASH_BUCKET, FLASH_STRENGTH
-    global CVD, LAST_TRADES, TRADE_TIMESTAMPS
+    global CVD, LAST_TRADES
+    global TRADE_TIMESTAMPS, BUY_TIMESTAMPS, SELL_TIMESTAMPS
+    global PREV_TRADE_PRICE, PRICE_DISPLACEMENT
 
     bucket = _bucket_from_price(price)
 
-    # Create bucket entry if missing
+    # Create bucket if missing
     if bucket not in PRICE_BUCKETS:
         PRICE_BUCKETS[bucket] = {"buy": 0.0, "sell": 0.0}
 
@@ -84,19 +100,34 @@ def _update_price_bucket(price: float, volume: float, side: str):
     # ------------------------
     # Last 10 trades storage
     # ------------------------
-    trade_record = {
+    ts_now = time.time()
+    LAST_TRADES.append({
         "price": price,
         "volume": volume,
         "side": side,
-        "time": time.time()
-    }
-    LAST_TRADES.append(trade_record)
-    LAST_TRADES = LAST_TRADES[-10:]  # keep newest 10
+        "time": ts_now
+    })
+    LAST_TRADES[:] = LAST_TRADES[-10:]
 
     # ------------------------
-    # Trade velocity timestamp
+    # Velocity tracking
     # ------------------------
-    TRADE_TIMESTAMPS.append(time.time())
+    TRADE_TIMESTAMPS.append(ts_now)
+
+    if side == "buy":
+        BUY_TIMESTAMPS.append((ts_now, volume))
+    else:
+        SELL_TIMESTAMPS.append((ts_now, volume))
+
+    # ------------------------
+    # Panel 7: Micro-momentum (ΔPrice per trade)
+    # ------------------------
+    if PREV_TRADE_PRICE is not None:
+        displacement = price - PREV_TRADE_PRICE
+        PRICE_DISPLACEMENT.append((ts_now, displacement))
+        PRICE_DISPLACEMENT[:] = PRICE_DISPLACEMENT[-300:]  # keep last ~300 trades
+
+    PREV_TRADE_PRICE = price
 
 
 def _decay_flash():
@@ -110,32 +141,26 @@ def _decay_flash():
 
 
 # ============================================================
-# MAIN WEBSOCKET LOOP (STABLE VERSION)
+# MAIN WEBSOCKET LOOP (STABLE RECONNECTING VERSION)
 # ============================================================
 
 async def _ws_loop():
-    """
-    Stable Kraken Futures WebSocket loop.
-    Uses a reconnecting outer loop to prevent recursion.
-    Only one WS loop runs at a time.
-    """
     global WS_RUNNING
 
     url = "wss://futures.kraken.com/ws/v1"
 
-    while True:  # Reconnect loop
+    while True:
         print("WebSocket: Connecting...")
 
         try:
             async with websockets.connect(url, ping_interval=None) as ws:
 
-                # Subscribe feeds
+                # Subscribe to feeds
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "ticker",
                     "product_ids": ["PF_SOLUSD"]
                 }))
-
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "trade",
@@ -145,31 +170,26 @@ async def _ws_loop():
                 WS_RUNNING = True
                 print("WebSocket: Connected.")
 
-                # ---------- MESSAGE LOOP ----------
+                # ---- MESSAGE LOOP ----
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
                     except asyncio.TimeoutError:
-                        # Keep alive
                         await ws.ping()
                         continue
 
                     data = json.loads(msg)
 
-                    # -----------------------------
-                    # TICKER FEED
-                    # -----------------------------
+                    # ---- Ticker ----
                     if data.get("feed") == "ticker" and "product_id" in data:
                         LATEST_DATA[data["product_id"]] = data
                         _decay_flash()
                         continue
 
-                    # -----------------------------
-                    # FUTURES TRADE FEED
-                    # -----------------------------
+                    # ---- Trades ----
                     if data.get("feed") == "trade":
 
-                        # Futures single-trade format
+                        # Futures format
                         if "price" in data and "qty" in data:
                             try:
                                 price = float(data["price"])
@@ -188,7 +208,7 @@ async def _ws_loop():
                             _decay_flash()
                             continue
 
-                        # Spot multi-trade fallback
+                        # Spot fallback (rare)
                         if "trades" in data:
                             for t in data["trades"]:
                                 try:
@@ -219,10 +239,7 @@ async def _ws_loop():
 # ============================================================
 
 def start_ws_thread():
-    """
-    Launch WebSocket loop in a background thread.
-    Ensures only one WS thread exists.
-    """
+    """Launch WebSocket loop in a background thread."""
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
