@@ -7,38 +7,47 @@ import websockets
 
 from data.metrics_engine import add_trade
 
+
 # ============================================================
 # GLOBAL STATE
 # ============================================================
 
-LATEST_DATA = {}           # latest ticker snapshot
+LATEST_DATA = {}
 WS_RUNNING = False
 
-# ---- Panel 3 bucket engine ----
-PRICE_BUCKETS = {}         # { bucket_price : { "buy": vol, "sell": vol } }
+# ---- Panel 3 buckets (permanent) ----
+PRICE_BUCKETS = {}
 BUCKET_SIZE = 0.50
 
-LAST_BUCKET = None         # last bucket that received a trade
-LAST_PRICE = None          # last trade price
-LAST_SIDE = None           # side of last trade
+LAST_BUCKET = None
+LAST_PRICE = None
+LAST_SIDE = None
 
-# ---- Flash Pulse Effect ----
+# ---- Flash effect ----
 FLASH_BUCKET = None
 FLASH_STRENGTH = 1.0
 FLASH_DECAY = 0.85
 
-# ---- Panels 4,5,6 ----
+# ---- CVD, tape, velocity ----
 CVD = 0.0
-LAST_TRADES = []                # last 10 trades
+LAST_TRADES = []
 
-# Velocity tracking
-TRADE_TIMESTAMPS = []           # for TPS
-BUY_TIMESTAMPS = []             # (timestamp, volume)
-SELL_TIMESTAMPS = []            # (timestamp, volume)
+TRADE_TIMESTAMPS = []
+BUY_TIMESTAMPS = []
+SELL_TIMESTAMPS = []
 
-# ---- Panel 7: Micro-momentum tracking ----
+# ---- Panel 7: Micro-Momentum ----
 PREV_TRADE_PRICE = None
-PRICE_DISPLACEMENT = []         # list of (timestamp, ΔPrice)
+PRICE_DISPLACEMENT = []      # (timestamp, ΔPrice)
+
+# ------------------------------------------------------------
+# PANEL 8 — REAL HOURLY PRICE MOVEMENT (OHLC)
+# ------------------------------------------------------------
+HOURLY_FLOW = {}   # hour_ts → { open, close, high, low, buy_vol, sell_vol }
+
+def _get_hour_timestamp(ts):
+    """Return timestamp rounded down to the start of the hour."""
+    return int(ts // 3600 * 3600)
 
 
 # ============================================================
@@ -50,30 +59,65 @@ def get_latest(symbol):
 
 
 def _bucket_from_price(price: float) -> float:
-    """Compute bucket rounded to BUCKET_SIZE (default 0.50)."""
     return round(price / BUCKET_SIZE) * BUCKET_SIZE
 
 
 def _update_price_bucket(price: float, volume: float, side: str):
     """
-    Update all internal engines:
-    - Bucket volume
-    - Last trade info
-    - Flash pulse
+    Updates:
+    - Buckets
+    - Flash effect
     - CVD
-    - Last trades tape
-    - Volume velocity
-    - Micro-momentum (ΔPrice per trade)
+    - Tape
+    - Velocity
+    - Micro-momentum
+    - REAL HOURLY PRICE MOVEMENT (Panel 8)
     """
     global LAST_BUCKET, LAST_PRICE, LAST_SIDE
     global FLASH_BUCKET, FLASH_STRENGTH
     global CVD, LAST_TRADES
-    global TRADE_TIMESTAMPS, BUY_TIMESTAMPS, SELL_TIMESTAMPS
     global PREV_TRADE_PRICE, PRICE_DISPLACEMENT
+    global TRADE_TIMESTAMPS, BUY_TIMESTAMPS, SELL_TIMESTAMPS
+    global HOURLY_FLOW
+
+    ts_now = time.time()
+    hour_ts = _get_hour_timestamp(ts_now)
+
+    # ============================================
+    #   1) HOURLY PRICE ENGINE (REAL MOVEMENT)
+    # ============================================
+    if hour_ts not in HOURLY_FLOW:
+        HOURLY_FLOW[hour_ts] = {
+            "open": price,
+            "close": price,
+            "high": price,
+            "low": price,
+            "buy_vol": 0.0,
+            "sell_vol": 0.0
+        }
+
+    h = HOURLY_FLOW[hour_ts]
+    h["close"] = price
+    h["high"] = max(h["high"], price)
+    h["low"] = min(h["low"], price)
+
+    if side == "buy":
+        h["buy_vol"] += volume
+    else:
+        h["sell_vol"] += volume
+
+    # keep last 24 hours
+    if len(HOURLY_FLOW) > 48:   # a bit more as buffer
+        oldest = sorted(HOURLY_FLOW.keys())[:-24]
+        for k in oldest:
+            HOURLY_FLOW.pop(k, None)
+
+    # ============================================
+    #   2) PANEL 3 + CVD + MOMENTUM
+    # ============================================
 
     bucket = _bucket_from_price(price)
 
-    # Create bucket if missing
     if bucket not in PRICE_BUCKETS:
         PRICE_BUCKETS[bucket] = {"buy": 0.0, "sell": 0.0}
 
@@ -82,25 +126,15 @@ def _update_price_bucket(price: float, volume: float, side: str):
 
     PRICE_BUCKETS[bucket][side] += volume
 
-    # Store last-trade attributes
     LAST_BUCKET = bucket
     LAST_PRICE = price
     LAST_SIDE = side
 
-    # Flash pulse activate
     FLASH_BUCKET = bucket
     FLASH_STRENGTH = 1.0
 
-    # ------------------------
-    # CVD update
-    # ------------------------
-    delta = volume if side == "buy" else -volume
-    CVD += delta
+    CVD += volume if side == "buy" else -volume
 
-    # ------------------------
-    # Last 10 trades storage
-    # ------------------------
-    ts_now = time.time()
     LAST_TRADES.append({
         "price": price,
         "volume": volume,
@@ -109,31 +143,22 @@ def _update_price_bucket(price: float, volume: float, side: str):
     })
     LAST_TRADES[:] = LAST_TRADES[-10:]
 
-    # ------------------------
-    # Velocity tracking
-    # ------------------------
     TRADE_TIMESTAMPS.append(ts_now)
-
     if side == "buy":
         BUY_TIMESTAMPS.append((ts_now, volume))
     else:
         SELL_TIMESTAMPS.append((ts_now, volume))
 
-    # ------------------------
-    # Panel 7: Micro-momentum (ΔPrice per trade)
-    # ------------------------
+    # Micro-momentum
     if PREV_TRADE_PRICE is not None:
-        displacement = price - PREV_TRADE_PRICE
-        PRICE_DISPLACEMENT.append((ts_now, displacement))
-        PRICE_DISPLACEMENT[:] = PRICE_DISPLACEMENT[-300:]  # keep last ~300 trades
+        PRICE_DISPLACEMENT.append((ts_now, price - PREV_TRADE_PRICE))
+        PRICE_DISPLACEMENT[:] = PRICE_DISPLACEMENT[-300:]
 
     PREV_TRADE_PRICE = price
 
 
 def _decay_flash():
-    """Fade out the neon pulse highlight."""
     global FLASH_STRENGTH, FLASH_BUCKET
-
     if FLASH_BUCKET is not None:
         FLASH_STRENGTH *= FLASH_DECAY
         if FLASH_STRENGTH < 0.05:
@@ -141,36 +166,36 @@ def _decay_flash():
 
 
 # ============================================================
-# MAIN WEBSOCKET LOOP (STABLE RECONNECTING VERSION)
+# WEBSOCKET LOOP
 # ============================================================
 
 async def _ws_loop():
     global WS_RUNNING
 
     url = "wss://futures.kraken.com/ws/v1"
+    product = "PF_SOLUSD"
 
     while True:
-        print("WebSocket: Connecting...")
+        print(f"WebSocket: Connecting to {product}...")
 
         try:
             async with websockets.connect(url, ping_interval=None) as ws:
 
-                # Subscribe to feeds
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "ticker",
-                    "product_ids": ["PF_SOLUSD"]
+                    "product_ids": [product]
                 }))
+
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "trade",
-                    "product_ids": ["PF_SOLUSD"]
+                    "product_ids": [product]
                 }))
 
                 WS_RUNNING = True
                 print("WebSocket: Connected.")
 
-                # ---- MESSAGE LOOP ----
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -180,22 +205,20 @@ async def _ws_loop():
 
                     data = json.loads(msg)
 
-                    # ---- Ticker ----
-                    if data.get("feed") == "ticker" and "product_id" in data:
-                        LATEST_DATA[data["product_id"]] = data
+                    if data.get("feed") == "ticker":
+                        if "product_id" in data:
+                            LATEST_DATA[data["product_id"]] = data
                         _decay_flash()
                         continue
 
-                    # ---- Trades ----
                     if data.get("feed") == "trade":
 
-                        # Futures format
+                        # PF Futures format
                         if "price" in data and "qty" in data:
                             try:
                                 price = float(data["price"])
                                 volume = float(data["qty"])
                                 side = data.get("side", "buy")
-
                                 ts_ms = data.get("time")
                                 ts = ts_ms / 1000 if ts_ms else time.time()
 
@@ -204,11 +227,10 @@ async def _ws_loop():
 
                             except Exception as e:
                                 print("Trade parse error:", e)
-
                             _decay_flash()
                             continue
 
-                        # Spot fallback (rare)
+                        # Spot-type fallback
                         if "trades" in data:
                             for t in data["trades"]:
                                 try:
@@ -219,10 +241,8 @@ async def _ws_loop():
 
                                     add_trade(price, volume, side, ts)
                                     _update_price_bucket(price, volume, side)
-
-                                except Exception as e:
-                                    print("Trade parse error:", e)
-
+                                except:
+                                    pass
                             _decay_flash()
                             continue
 
@@ -239,7 +259,6 @@ async def _ws_loop():
 # ============================================================
 
 def start_ws_thread():
-    """Launch WebSocket loop in a background thread."""
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
