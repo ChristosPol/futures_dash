@@ -2,83 +2,158 @@
 import plotly.graph_objects as go
 from dash import html, dcc, Input, Output
 import data.ws_client as ws
+import numpy as np
+from collections import deque
+import time
 
-BUCKET_SIZE = ws.BUCKET_SIZE
+# Store volume history over time for heatmap
+# Structure: {price_level: deque([(timestamp, buy_vol, sell_vol), ...], maxlen=100)}
+VOLUME_HISTORY = {}
+MAX_TIME_POINTS = 100  # Keep last 100 time points
 
 def layout():
     return html.Div(
         className="panel",
         children=[
             html.Div(
-                id="panel3-title",
+                "Order Flow Heatmap (Bookmap Style) — PF_SOLUSD",
                 className="panel-title"
             ),
             dcc.Graph(
-                id="panel3-histogram",
+                id="panel3-heatmap",
                 config={"displayModeBar": False},
                 style={"width": "100%", "height": "100%"}
             ),
-            dcc.Interval(id="panel3-interval", interval=2000, n_intervals=0)
+            dcc.Interval(id="panel3-interval", interval=1000, n_intervals=0)
         ]
     )
 
 def register_callbacks(app):
 
     @app.callback(
-        Output("panel3-histogram", "figure"),
-        Output("panel3-title", "children"),
+        Output("panel3-heatmap", "figure"),
         Input("panel3-interval", "n_intervals")
     )
-    def update_hist(_):
-
+    def update_heatmap(_):
+        
+        global VOLUME_HISTORY
+        
         if not ws.PRICE_BUCKETS:
-            return go.Figure(), "Waiting for data..."
+            return go.Figure().update_layout(
+                template="plotly_dark",
+                title="Waiting for data..."
+            )
 
-        # --------------------------------------
-        # KEEP ALL BUCKETS (no windowing)
-        # --------------------------------------
-        buckets = sorted(ws.PRICE_BUCKETS.keys())
-
-        buy_vol = [ws.PRICE_BUCKETS[b]["buy"] for b in buckets]
-        sell_vol = [ws.PRICE_BUCKETS[b]["sell"] for b in buckets]
-        labels = [f"{b:.2f}" for b in buckets]
-
+        current_time = time.time()
+        
+        # Update volume history for each price bucket
+        for price, volumes in ws.PRICE_BUCKETS.items():
+            if price not in VOLUME_HISTORY:
+                VOLUME_HISTORY[price] = deque(maxlen=MAX_TIME_POINTS)
+            
+            buy_vol = volumes.get("buy", 0)
+            sell_vol = volumes.get("sell", 0)
+            
+            # Add current snapshot
+            VOLUME_HISTORY[price].append((current_time, buy_vol, sell_vol))
+        
+        # Get all price levels (sorted)
+        all_prices = sorted(VOLUME_HISTORY.keys())
+        
+        if not all_prices:
+            return go.Figure().update_layout(template="plotly_dark")
+        
+        # Get all timestamps from the most recent price level
+        if all_prices and VOLUME_HISTORY[all_prices[0]]:
+            timestamps = [t for t, _, _ in VOLUME_HISTORY[all_prices[0]]]
+        else:
+            return go.Figure().update_layout(template="plotly_dark")
+        
+        # Build 2D matrix for heatmap
+        # Rows = price levels, Columns = time points
+        num_prices = len(all_prices)
+        num_times = len(timestamps)
+        
+        # Create separate matrices for buys and sells
+        buy_matrix = np.zeros((num_prices, num_times))
+        sell_matrix = np.zeros((num_prices, num_times))
+        
+        for i, price in enumerate(all_prices):
+            history = list(VOLUME_HISTORY[price])
+            for j in range(min(len(history), num_times)):
+                _, buy_vol, sell_vol = history[j]
+                buy_matrix[i, j] = buy_vol
+                sell_matrix[i, j] = sell_vol
+        
+        # Net volume (positive = more buys, negative = more sells)
+        net_matrix = buy_matrix - sell_matrix
+        
+        # Normalize for better color scaling
+        max_abs = np.max(np.abs(net_matrix)) if np.max(np.abs(net_matrix)) > 0 else 1
+        normalized = net_matrix / max_abs
+        
+        # Create time labels (relative seconds)
+        time_labels = [f"{i}s" for i in range(num_times)]
+        price_labels = [f"${p:.2f}" for p in all_prices]
+        
         fig = go.Figure()
-
-        # SELL bars (negative)
-        fig.add_trace(go.Bar(
-            y=labels,
-            x=[-v for v in sell_vol],
-            orientation="h",
-            marker_color="red",
-            name="Sells"
+        
+        # Add heatmap
+        fig.add_trace(go.Heatmap(
+            z=normalized,
+            x=time_labels,
+            y=price_labels,
+            colorscale=[
+                [0.0, 'rgb(200, 0, 0)'],    # Dark red (heavy selling)
+                [0.3, 'rgb(255, 50, 50)'],  # Red
+                [0.45, 'rgb(50, 50, 50)'],  # Dark gray (neutral)
+                [0.55, 'rgb(50, 50, 50)'],  # Dark gray (neutral)
+                [0.7, 'rgb(50, 255, 50)'],  # Green
+                [1.0, 'rgb(0, 200, 0)']     # Dark green (heavy buying)
+            ],
+            showscale=True,
+            colorbar=dict(
+                title="Volume Imbalance",
+                x=1.02,
+                tickmode="array",
+                tickvals=[-1, -0.5, 0, 0.5, 1],
+                ticktext=["Sell", "Sell", "Neutral", "Buy", "Buy"]
+            ),
+            hovertemplate='Time: %{x}<br>Price: %{y}<br>Net: %{z:.2f}<extra></extra>'
         ))
-
-        # BUY bars (positive)
-        fig.add_trace(go.Bar(
-            y=labels,
-            x=buy_vol,
-            orientation="h",
-            marker_color="green",
-            name="Buys"
-        ))
-
-        # --------------------------------------
-        # FIX X-RANGE SO BARS NEVER DISAPPEAR
-        # --------------------------------------
-        max_buy = max(buy_vol) if buy_vol else 0
-        max_sell = max(sell_vol) if sell_vol else 0
-
-        fig.update_xaxes(range=[-max_sell * 1.2, max_buy * 1.2])
-
+        
+        # Add current price line
+        if ws.LAST_PRICE:
+            # Find closest price in our list
+            closest_idx = min(range(len(all_prices)), 
+                            key=lambda i: abs(all_prices[i] - ws.LAST_PRICE))
+            
+            fig.add_shape(
+                type="line",
+                x0=0,
+                x1=num_times - 1,
+                y0=closest_idx,
+                y1=closest_idx,
+                line=dict(color="yellow", width=3),
+                xref="x",
+                yref="y"
+            )
+        
         fig.update_layout(
             template="plotly_dark",
-            barmode="relative",
-            margin=dict(l=70, r=40, t=40, b=40),
-            xaxis_title="Volume",
-            yaxis_title=f"Buckets (size = {BUCKET_SIZE})"
+            margin=dict(l=80, r=120, t=40, b=60),
+            xaxis_title="Time (recent →)",
+            yaxis_title="Price Levels",
+            plot_bgcolor='black',
+            xaxis=dict(
+                showgrid=False,
+                tickmode='linear',
+                tick0=0,
+                dtick=10
+            ),
+            yaxis=dict(
+                showgrid=False
+            )
         )
-
-        title = f"Live Buy/Sell Volume by Price Bucket (0.50 USD) — PF_SOLUSD — Price {ws.LAST_PRICE:.2f}"
-
-        return fig, title
+        
+        return fig

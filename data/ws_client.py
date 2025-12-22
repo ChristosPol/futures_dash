@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import websockets
+from collections import deque
 
 from data.metrics_engine import add_trade
 
@@ -41,13 +42,61 @@ PREV_TRADE_PRICE = None
 PRICE_DISPLACEMENT = []      # (timestamp, ΔPrice)
 
 # ------------------------------------------------------------
-# PANEL 8 — REAL HOURLY PRICE MOVEMENT (OHLC)
+# PANEL 8 – REAL HOURLY PRICE MOVEMENT (OHLC)
 # ------------------------------------------------------------
 HOURLY_FLOW = {}   # hour_ts → { open, close, high, low, buy_vol, sell_vol }
 
 def _get_hour_timestamp(ts):
     """Return timestamp rounded down to the start of the hour."""
     return int(ts // 3600 * 3600)
+
+
+# ============================================================
+# PANEL 1 - MULTI-COIN LIVE TRADES
+# ============================================================
+MULTI_COIN_TRADES = {
+    "PF_XBTUSD": deque(maxlen=2000),
+    "PF_ETHUSD": deque(maxlen=2000),
+    "PF_SOLUSD": deque(maxlen=2000),
+    "PF_ADAUSD": deque(maxlen=2000)
+}
+
+COIN_REFERENCE_PRICES = {}
+
+TRADE_COUNTS = {
+    "PF_XBTUSD": 0,
+    "PF_ETHUSD": 0,
+    "PF_SOLUSD": 0,
+    "PF_ADAUSD": 0
+}
+
+
+# ============================================================
+# PANEL 2 - ORDER BOOK DEPTH
+# ============================================================
+ORDER_BOOK = {
+    "bids": [],  # [[price, volume], ...]
+    "asks": []   # [[price, volume], ...]
+}
+
+
+def _update_multi_coin_trade(product_id, price, timestamp):
+    """
+    Store trade for multi-coin chart (Panel 1).
+    Each coin stores: (timestamp, price)
+    """
+    if product_id not in MULTI_COIN_TRADES:
+        return
+    
+    if product_id not in COIN_REFERENCE_PRICES:
+        COIN_REFERENCE_PRICES[product_id] = price
+        print(f"✓ Set reference price for {product_id}: ${price:.2f}")
+    
+    MULTI_COIN_TRADES[product_id].append((timestamp, price))
+    TRADE_COUNTS[product_id] += 1
+    
+    if TRADE_COUNTS[product_id] % 100 == 0:
+        print(f"📊 {product_id}: {TRADE_COUNTS[product_id]} trades, last price ${price:.2f}")
 
 
 # ============================================================
@@ -107,7 +156,7 @@ def _update_price_bucket(price: float, volume: float, side: str):
         h["sell_vol"] += volume
 
     # keep last 24 hours
-    if len(HOURLY_FLOW) > 48:   # a bit more as buffer
+    if len(HOURLY_FLOW) > 48:
         oldest = sorted(HOURLY_FLOW.keys())[:-24]
         for k in oldest:
             HOURLY_FLOW.pop(k, None)
@@ -141,7 +190,7 @@ def _update_price_bucket(price: float, volume: float, side: str):
         "side": side,
         "time": ts_now
     })
-    LAST_TRADES[:] = LAST_TRADES[-10:]
+    LAST_TRADES[:] = LAST_TRADES[-20:]
 
     TRADE_TIMESTAMPS.append(ts_now)
     if side == "buy":
@@ -170,31 +219,40 @@ def _decay_flash():
 # ============================================================
 
 async def _ws_loop():
-    global WS_RUNNING
+    global WS_RUNNING, ORDER_BOOK
 
     url = "wss://futures.kraken.com/ws/v1"
-    product = "PF_SOLUSD"
+    products = ["PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_ADAUSD"]
 
     while True:
-        print(f"WebSocket: Connecting to {product}...")
+        print(f"WebSocket: Connecting to {products}...")
 
         try:
             async with websockets.connect(url, ping_interval=None) as ws:
 
+                # Subscribe to ticker
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "ticker",
-                    "product_ids": [product]
+                    "product_ids": products
                 }))
 
+                # Subscribe to trades
                 await ws.send(json.dumps({
                     "event": "subscribe",
                     "feed": "trade",
-                    "product_ids": [product]
+                    "product_ids": products
+                }))
+
+                # Subscribe to order book (for PF_SOLUSD)
+                await ws.send(json.dumps({
+                    "event": "subscribe",
+                    "feed": "book",
+                    "product_ids": ["PF_SOLUSD"]
                 }))
 
                 WS_RUNNING = True
-                print("WebSocket: Connected.")
+                print("WebSocket: Connected and subscribed to all products.")
 
                 while True:
                     try:
@@ -205,15 +263,66 @@ async def _ws_loop():
 
                     data = json.loads(msg)
 
+                    # Debug: Print subscription confirmations
+                    if data.get("event") == "subscribed":
+                        print(f"✓ Subscribed to {data.get('feed')} for {data.get('product_ids')}")
+                        continue
+
                     if data.get("feed") == "ticker":
                         if "product_id" in data:
                             LATEST_DATA[data["product_id"]] = data
                         _decay_flash()
                         continue
 
-                    if data.get("feed") == "trade":
+                    # ===== ORDER BOOK UPDATES =====
+                    if data.get("feed") == "book_snapshot":
+                        # Full order book snapshot
+                        if data.get("product_id") == "PF_SOLUSD":
+                            try:
+                                bids_data = data.get("bids", [])
+                                asks_data = data.get("asks", [])
+                                
+                                ORDER_BOOK["bids"] = [[float(b["price"]), float(b["qty"])] for b in bids_data]
+                                ORDER_BOOK["asks"] = [[float(a["price"]), float(a["qty"])] for a in asks_data]
+                                print(f"📖 Order book snapshot received: {len(ORDER_BOOK['bids'])} bids, {len(ORDER_BOOK['asks'])} asks")
+                            except Exception as e:
+                                print(f"Error parsing book snapshot: {e}, data: {data}")
+                        continue
 
-                        # PF Futures format
+                    if data.get("feed") == "book":
+                        # Incremental order book update (ONE LEVEL AT A TIME)
+                        if data.get("product_id") == "PF_SOLUSD":
+                            try:
+                                side = data.get("side")  # "buy" or "sell"
+                                price = float(data.get("price"))
+                                qty = float(data.get("qty"))
+                                
+                                if side == "buy":
+                                    # Update bids
+                                    ORDER_BOOK["bids"] = [b for b in ORDER_BOOK["bids"] if b[0] != price]
+                                    if qty > 0:
+                                        ORDER_BOOK["bids"].append([price, qty])
+                                    # Keep sorted (highest first)
+                                    ORDER_BOOK["bids"].sort(key=lambda x: x[0], reverse=True)
+                                    ORDER_BOOK["bids"] = ORDER_BOOK["bids"][:100]
+                                    
+                                elif side == "sell":
+                                    # Update asks
+                                    ORDER_BOOK["asks"] = [a for a in ORDER_BOOK["asks"] if a[0] != price]
+                                    if qty > 0:
+                                        ORDER_BOOK["asks"].append([price, qty])
+                                    # Keep sorted (lowest first)
+                                    ORDER_BOOK["asks"].sort(key=lambda x: x[0])
+                                    ORDER_BOOK["asks"] = ORDER_BOOK["asks"][:100]
+
+                            except Exception as e:
+                                print(f"Error parsing book update: {e}, data: {data}")
+
+                        continue
+
+                    if data.get("feed") == "trade":
+                        product_id = data.get("product_id")
+
                         if "price" in data and "qty" in data:
                             try:
                                 price = float(data["price"])
@@ -222,15 +331,17 @@ async def _ws_loop():
                                 ts_ms = data.get("time")
                                 ts = ts_ms / 1000 if ts_ms else time.time()
 
-                                add_trade(price, volume, side, ts)
-                                _update_price_bucket(price, volume, side)
+                                _update_multi_coin_trade(product_id, price, ts)
+
+                                if product_id == "PF_SOLUSD":
+                                    add_trade(price, volume, side, ts)
+                                    _update_price_bucket(price, volume, side)
 
                             except Exception as e:
-                                print("Trade parse error:", e)
+                                print(f"Trade parse error for {product_id}:", e)
                             _decay_flash()
                             continue
 
-                        # Spot-type fallback
                         if "trades" in data:
                             for t in data["trades"]:
                                 try:
@@ -239,8 +350,11 @@ async def _ws_loop():
                                     side = t.get("side", "buy")
                                     ts = t.get("timestamp", time.time())
 
-                                    add_trade(price, volume, side, ts)
-                                    _update_price_bucket(price, volume, side)
+                                    _update_multi_coin_trade(product_id, price, ts)
+
+                                    if product_id == "PF_SOLUSD":
+                                        add_trade(price, volume, side, ts)
+                                        _update_price_bucket(price, volume, side)
                                 except:
                                     pass
                             _decay_flash()
