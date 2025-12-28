@@ -4,7 +4,7 @@ import json
 import threading
 import time
 import websockets
-from collections import deque
+from collections import deque, defaultdict
 
 from data.metrics_engine import add_trade
 
@@ -42,9 +42,9 @@ PREV_TRADE_PRICE = None
 PRICE_DISPLACEMENT = []      # (timestamp, ΔPrice)
 
 # ------------------------------------------------------------
-# PANEL 8 – REAL HOURLY PRICE MOVEMENT (OHLC)
+# PANEL 8 & 9 – REAL HOURLY PRICE MOVEMENT (OHLC) + FOOTPRINT
 # ------------------------------------------------------------
-HOURLY_FLOW = {}   # hour_ts → { open, close, high, low, buy_vol, sell_vol }
+HOURLY_FLOW = {}   # hour_ts → { open, close, high, low, buy_vol, sell_vol, price_levels }
 
 def _get_hour_timestamp(ts):
     """Return timestamp rounded down to the start of the hour."""
@@ -121,6 +121,7 @@ def _update_price_bucket(price: float, volume: float, side: str):
     - Velocity
     - Micro-momentum
     - REAL HOURLY PRICE MOVEMENT (Panel 8)
+    - HOURLY FOOTPRINT WITH PRICE LEVELS (Panel 9)
     """
     global LAST_BUCKET, LAST_PRICE, LAST_SIDE
     global FLASH_BUCKET, FLASH_STRENGTH
@@ -133,7 +134,7 @@ def _update_price_bucket(price: float, volume: float, side: str):
     hour_ts = _get_hour_timestamp(ts_now)
 
     # ============================================
-    #   1) HOURLY PRICE ENGINE (REAL MOVEMENT)
+    #   1) HOURLY PRICE ENGINE (REAL MOVEMENT + FOOTPRINT)
     # ============================================
     if hour_ts not in HOURLY_FLOW:
         HOURLY_FLOW[hour_ts] = {
@@ -142,7 +143,8 @@ def _update_price_bucket(price: float, volume: float, side: str):
             "high": price,
             "low": price,
             "buy_vol": 0.0,
-            "sell_vol": 0.0
+            "sell_vol": 0.0,
+            "price_levels": defaultdict(lambda: {"buy": 0.0, "sell": 0.0})  # NEW: track volume per price
         }
 
     h = HOURLY_FLOW[hour_ts]
@@ -150,10 +152,18 @@ def _update_price_bucket(price: float, volume: float, side: str):
     h["high"] = max(h["high"], price)
     h["low"] = min(h["low"], price)
 
+    # Update total volume
     if side == "buy":
         h["buy_vol"] += volume
     else:
         h["sell_vol"] += volume
+    
+    # NEW: Update volume at specific price level (0.25 buckets for footprint)
+    price_bucket = round(price * 4) / 4  # 0.25 increments
+    if side == "buy":
+        h["price_levels"][price_bucket]["buy"] += volume
+    else:
+        h["price_levels"][price_bucket]["sell"] += volume
 
     # keep last 24 hours
     if len(HOURLY_FLOW) > 48:
@@ -276,7 +286,6 @@ async def _ws_loop():
 
                     # ===== ORDER BOOK UPDATES =====
                     if data.get("feed") == "book_snapshot":
-                        # Full order book snapshot
                         if data.get("product_id") == "PF_SOLUSD":
                             try:
                                 bids_data = data.get("bids", [])
@@ -286,37 +295,32 @@ async def _ws_loop():
                                 ORDER_BOOK["asks"] = [[float(a["price"]), float(a["qty"])] for a in asks_data]
                                 print(f"📖 Order book snapshot received: {len(ORDER_BOOK['bids'])} bids, {len(ORDER_BOOK['asks'])} asks")
                             except Exception as e:
-                                print(f"Error parsing book snapshot: {e}, data: {data}")
+                                print(f"Error parsing book snapshot: {e}")
                         continue
 
                     if data.get("feed") == "book":
-                        # Incremental order book update (ONE LEVEL AT A TIME)
                         if data.get("product_id") == "PF_SOLUSD":
                             try:
-                                side = data.get("side")  # "buy" or "sell"
+                                side = data.get("side")
                                 price = float(data.get("price"))
                                 qty = float(data.get("qty"))
                                 
                                 if side == "buy":
-                                    # Update bids
                                     ORDER_BOOK["bids"] = [b for b in ORDER_BOOK["bids"] if b[0] != price]
                                     if qty > 0:
                                         ORDER_BOOK["bids"].append([price, qty])
-                                    # Keep sorted (highest first)
                                     ORDER_BOOK["bids"].sort(key=lambda x: x[0], reverse=True)
-                                    ORDER_BOOK["bids"] = ORDER_BOOK["bids"][:100]
+                                    ORDER_BOOK["bids"] = ORDER_BOOK["bids"][:500]
                                     
                                 elif side == "sell":
-                                    # Update asks
                                     ORDER_BOOK["asks"] = [a for a in ORDER_BOOK["asks"] if a[0] != price]
                                     if qty > 0:
                                         ORDER_BOOK["asks"].append([price, qty])
-                                    # Keep sorted (lowest first)
                                     ORDER_BOOK["asks"].sort(key=lambda x: x[0])
-                                    ORDER_BOOK["asks"] = ORDER_BOOK["asks"][:100]
+                                    ORDER_BOOK["asks"] = ORDER_BOOK["asks"][:500]
 
                             except Exception as e:
-                                print(f"Error parsing book update: {e}, data: {data}")
+                                print(f"Error parsing book update: {e}")
 
                         continue
 

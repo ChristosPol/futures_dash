@@ -6,154 +6,209 @@ import numpy as np
 from collections import deque
 import time
 
-# Store volume history over time for heatmap
-# Structure: {price_level: deque([(timestamp, buy_vol, sell_vol), ...], maxlen=100)}
-VOLUME_HISTORY = {}
-MAX_TIME_POINTS = 100  # Keep last 100 time points
+# Store order book history for bookmap visualization
+BOOKMAP_HISTORY = deque(maxlen=300)  # Keep 5 minutes at 1-second intervals
+PRICE_TRADES = deque(maxlen=300)  # Store price points for line overlay
 
 def layout():
     return html.Div(
         className="panel",
         children=[
             html.Div(
-                "Order Flow Heatmap (Bookmap Style) — PF_SOLUSD",
+                "Bookmap — Order Flow Visualization — PF_SOLUSD",
                 className="panel-title"
             ),
             dcc.Graph(
-                id="panel3-heatmap",
+                id="panel3-bookmap",
                 config={"displayModeBar": False},
                 style={"width": "100%", "height": "100%"}
             ),
-            dcc.Interval(id="panel3-interval", interval=1000, n_intervals=0)
+            dcc.Interval(id="panel3-interval", interval=1000, n_intervals=0)  # Update every second
         ]
     )
 
 def register_callbacks(app):
 
     @app.callback(
-        Output("panel3-heatmap", "figure"),
+        Output("panel3-bookmap", "figure"),
         Input("panel3-interval", "n_intervals")
     )
-    def update_heatmap(_):
+    def update_bookmap(_):
         
-        global VOLUME_HISTORY
+        global BOOKMAP_HISTORY, PRICE_TRADES
         
-        if not ws.PRICE_BUCKETS:
+        # Get current order book
+        bids = ws.ORDER_BOOK.get("bids", [])
+        asks = ws.ORDER_BOOK.get("asks", [])
+        
+        if not bids or not asks:
             return go.Figure().update_layout(
                 template="plotly_dark",
-                title="Waiting for data..."
+                title="Waiting for order book data..."
             )
-
+        
         current_time = time.time()
+        current_price = ws.LAST_PRICE if ws.LAST_PRICE else (bids[0][0] + asks[0][0]) / 2
         
-        # Update volume history for each price bucket
-        for price, volumes in ws.PRICE_BUCKETS.items():
-            if price not in VOLUME_HISTORY:
-                VOLUME_HISTORY[price] = deque(maxlen=MAX_TIME_POINTS)
-            
-            buy_vol = volumes.get("buy", 0)
-            sell_vol = volumes.get("sell", 0)
-            
-            # Add current snapshot
-            VOLUME_HISTORY[price].append((current_time, buy_vol, sell_vol))
+        # Store current price for line overlay
+        PRICE_TRADES.append((current_time, current_price))
         
-        # Get all price levels (sorted)
-        all_prices = sorted(VOLUME_HISTORY.keys())
+        # Aggregate order book into price buckets
+        bucket_size = 0.25
+        bid_dict = {}
+        for price, vol in bids[:50]:
+            bucket = round(price / bucket_size) * bucket_size
+            bid_dict[bucket] = bid_dict.get(bucket, 0) + vol
+        
+        ask_dict = {}
+        for price, vol in asks[:50]:
+            bucket = round(price / bucket_size) * bucket_size
+            ask_dict[bucket] = ask_dict.get(bucket, 0) + vol
+        
+        # Store snapshot
+        BOOKMAP_HISTORY.append({
+            "time": current_time,
+            "bids": bid_dict.copy(),
+            "asks": ask_dict.copy(),
+            "price": current_price
+        })
+        
+        if len(BOOKMAP_HISTORY) < 2:
+            return go.Figure().update_layout(template="plotly_dark", title="Collecting data...")
+        
+        # Get all unique price levels
+        all_prices = set()
+        for snapshot in BOOKMAP_HISTORY:
+            all_prices.update(snapshot["bids"].keys())
+            all_prices.update(snapshot["asks"].keys())
+        
+        all_prices = sorted(all_prices)
         
         if not all_prices:
             return go.Figure().update_layout(template="plotly_dark")
         
-        # Get all timestamps from the most recent price level
-        if all_prices and VOLUME_HISTORY[all_prices[0]]:
-            timestamps = [t for t, _, _ in VOLUME_HISTORY[all_prices[0]]]
-        else:
-            return go.Figure().update_layout(template="plotly_dark")
-        
-        # Build 2D matrix for heatmap
-        # Rows = price levels, Columns = time points
+        # Build heatmap matrix
         num_prices = len(all_prices)
-        num_times = len(timestamps)
+        num_times = len(BOOKMAP_HISTORY)
         
-        # Create separate matrices for buys and sells
-        buy_matrix = np.zeros((num_prices, num_times))
-        sell_matrix = np.zeros((num_prices, num_times))
+        liquidity_matrix = np.zeros((num_prices, num_times))
+        timestamps = []
         
-        for i, price in enumerate(all_prices):
-            history = list(VOLUME_HISTORY[price])
-            for j in range(min(len(history), num_times)):
-                _, buy_vol, sell_vol = history[j]
-                buy_matrix[i, j] = buy_vol
-                sell_matrix[i, j] = sell_vol
+        for t_idx, snapshot in enumerate(BOOKMAP_HISTORY):
+            timestamps.append(snapshot["time"])
+            
+            for p_idx, price in enumerate(all_prices):
+                bid_vol = snapshot["bids"].get(price, 0)
+                ask_vol = snapshot["asks"].get(price, 0)
+                # Total liquidity at this price level
+                liquidity_matrix[p_idx, t_idx] = bid_vol + ask_vol
         
-        # Net volume (positive = more buys, negative = more sells)
-        net_matrix = buy_matrix - sell_matrix
+        # Apply log scale for better visualization
+        liquidity_log = np.log1p(liquidity_matrix)
         
-        # Normalize for better color scaling
-        max_abs = np.max(np.abs(net_matrix)) if np.max(np.abs(net_matrix)) > 0 else 1
-        normalized = net_matrix / max_abs
-        
-        # Create time labels (relative seconds)
-        time_labels = [f"{i}s" for i in range(num_times)]
+        # Create time labels (seconds ago)
+        time_labels = [f"-{num_times - i}s" for i in range(num_times)]
         price_labels = [f"${p:.2f}" for p in all_prices]
         
         fig = go.Figure()
         
-        # Add heatmap
+        # Add liquidity heatmap
         fig.add_trace(go.Heatmap(
-            z=normalized,
-            x=time_labels,
-            y=price_labels,
+            z=liquidity_log,
+            x=list(range(num_times)),
+            y=all_prices,
             colorscale=[
-                [0.0, 'rgb(200, 0, 0)'],    # Dark red (heavy selling)
-                [0.3, 'rgb(255, 50, 50)'],  # Red
-                [0.45, 'rgb(50, 50, 50)'],  # Dark gray (neutral)
-                [0.55, 'rgb(50, 50, 50)'],  # Dark gray (neutral)
-                [0.7, 'rgb(50, 255, 50)'],  # Green
-                [1.0, 'rgb(0, 200, 0)']     # Dark green (heavy buying)
+                [0.0, 'rgb(0, 20, 40)'],      # Dark blue (low liquidity)
+                [0.3, 'rgb(0, 100, 150)'],    # Medium blue
+                [0.6, 'rgb(100, 200, 255)'],  # Light blue
+                [0.8, 'rgb(255, 200, 0)'],    # Yellow (high liquidity)
+                [1.0, 'rgb(255, 100, 0)']     # Orange (very high)
             ],
-            showscale=True,
-            colorbar=dict(
-                title="Volume Imbalance",
-                x=1.02,
-                tickmode="array",
-                tickvals=[-1, -0.5, 0, 0.5, 1],
-                ticktext=["Sell", "Sell", "Neutral", "Buy", "Buy"]
-            ),
-            hovertemplate='Time: %{x}<br>Price: %{y}<br>Net: %{z:.2f}<extra></extra>'
+            showscale=False,
+            hovertemplate='Time: %{x}<br>Price: $%{y:.2f}<br>Liquidity: %{z:.1f}<extra></extra>',
+            opacity=0.8
         ))
         
-        # Add current price line
-        if ws.LAST_PRICE:
-            # Find closest price in our list
-            closest_idx = min(range(len(all_prices)), 
-                            key=lambda i: abs(all_prices[i] - ws.LAST_PRICE))
+        # Add price line overlay (actual trades)
+        if len(PRICE_TRADES) > 1:
+            trade_times = [t for t, p in PRICE_TRADES]
+            trade_prices = [p for t, p in PRICE_TRADES]
             
-            fig.add_shape(
-                type="line",
-                x0=0,
-                x1=num_times - 1,
-                y0=closest_idx,
-                y1=closest_idx,
-                line=dict(color="yellow", width=3),
-                xref="x",
-                yref="y"
-            )
+            # Map timestamps to x-axis indices
+            min_time = timestamps[0]
+            x_indices = []
+            for t in trade_times:
+                if min_time <= t <= timestamps[-1]:
+                    # Find closest time index
+                    closest_idx = min(range(len(timestamps)), 
+                                    key=lambda i: abs(timestamps[i] - t))
+                    x_indices.append(closest_idx)
+                else:
+                    x_indices.append(None)
+            
+            # Filter out None values
+            valid_points = [(x, p) for x, p in zip(x_indices, trade_prices) if x is not None]
+            
+            if valid_points:
+                x_vals, y_vals = zip(*valid_points)
+                
+                # Determine colors based on price movement
+                colors = []
+                for i in range(len(y_vals)):
+                    if i == 0:
+                        colors.append('white')
+                    else:
+                        if y_vals[i] > y_vals[i-1]:
+                            colors.append('lime')  # Price up
+                        elif y_vals[i] < y_vals[i-1]:
+                            colors.append('red')   # Price down
+                        else:
+                            colors.append('white') # No change
+                
+                fig.add_trace(go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='markers+lines',
+                    marker=dict(
+                        size=6,
+                        color=colors,
+                        line=dict(color='white', width=1)
+                    ),
+                    line=dict(color='rgba(255, 255, 255, 0.3)', width=1),
+                    name='Price',
+                    showlegend=False,
+                    hovertemplate='Price: $%{y:.2f}<extra></extra>'
+                ))
+        
+        # Calculate volume bars (aggregated trades per time bucket)
+        volume_bars = []
+        for snapshot in BOOKMAP_HISTORY:
+            # Use trade volume from last second (approximate)
+            total_vol = sum(snapshot["bids"].values()) + sum(snapshot["asks"].values())
+            volume_bars.append(total_vol / 100)  # Scale down for display
         
         fig.update_layout(
             template="plotly_dark",
-            margin=dict(l=80, r=120, t=40, b=60),
-            xaxis_title="Time (recent →)",
-            yaxis_title="Price Levels",
-            plot_bgcolor='black',
+            margin=dict(l=60, r=20, t=10, b=40),
             xaxis=dict(
-                showgrid=False,
+                title="Time",
+                showgrid=True,
+                gridcolor='rgba(255, 255, 255, 0.1)',
+                showticklabels=True,
                 tickmode='linear',
                 tick0=0,
-                dtick=10
+                dtick=30,  # Tick every 30 seconds
+                ticktext=[f"-{num_times - i}s" for i in range(0, num_times, 30)],
+                tickvals=list(range(0, num_times, 30))
             ),
             yaxis=dict(
-                showgrid=False
-            )
+                title="Price",
+                showgrid=True,
+                gridcolor='rgba(255, 255, 255, 0.1)',
+                tickformat='$.2f'
+            ),
+            plot_bgcolor='black',
+            hovermode='closest'
         )
         
         return fig
