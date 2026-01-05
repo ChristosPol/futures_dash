@@ -8,7 +8,8 @@ import time
 
 # Store order book history for bookmap visualization
 BOOKMAP_HISTORY = deque(maxlen=300)  # Keep 5 minutes at 1-second intervals
-PRICE_TRADES = deque(maxlen=300)  # Store price points for line overlay
+ACTUAL_TRADES = deque(maxlen=500)  # Store ONLY actual trades (timestamp, price, volume, side)
+LAST_TRADE_TIME = 0  # Track last trade timestamp to detect new ones
 
 def layout():
     return html.Div(
@@ -23,7 +24,7 @@ def layout():
                 config={"displayModeBar": False},
                 style={"width": "100%", "height": "100%"}
             ),
-            dcc.Interval(id="panel3-interval", interval=1000, n_intervals=0)  # Update every second
+            dcc.Interval(id="panel3-interval", interval=1000, n_intervals=0)
         ]
     )
 
@@ -35,7 +36,7 @@ def register_callbacks(app):
     )
     def update_bookmap(_):
         
-        global BOOKMAP_HISTORY, PRICE_TRADES
+        global BOOKMAP_HISTORY, ACTUAL_TRADES, LAST_TRADE_TIME
         
         # Get current order book
         bids = ws.ORDER_BOOK.get("bids", [])
@@ -50,18 +51,30 @@ def register_callbacks(app):
         current_time = time.time()
         current_price = ws.LAST_PRICE if ws.LAST_PRICE else (bids[0][0] + asks[0][0]) / 2
         
-        # Store current price for line overlay
-        PRICE_TRADES.append((current_time, current_price))
+        # Check for NEW trades - get all trades newer than last recorded
+        if ws.LAST_TRADES:
+            for trade in ws.LAST_TRADES:
+                trade_time = trade["time"]
+                # Only add trades we haven't seen yet
+                if trade_time > LAST_TRADE_TIME:
+                    ACTUAL_TRADES.append((
+                        trade_time,
+                        trade["price"],
+                        trade["volume"],
+                        trade["side"]
+                    ))
+            # Update last trade time to the most recent
+            LAST_TRADE_TIME = max(t["time"] for t in ws.LAST_TRADES)
         
         # Aggregate order book into price buckets
         bucket_size = 0.25
         bid_dict = {}
-        for price, vol in bids[:50]:
+        for price, vol in bids:  # Use ALL bids
             bucket = round(price / bucket_size) * bucket_size
             bid_dict[bucket] = bid_dict.get(bucket, 0) + vol
         
         ask_dict = {}
-        for price, vol in asks[:50]:
+        for price, vol in asks:  # Use ALL asks
             bucket = round(price / bucket_size) * bucket_size
             ask_dict[bucket] = ask_dict.get(bucket, 0) + vol
         
@@ -76,13 +89,26 @@ def register_callbacks(app):
         if len(BOOKMAP_HISTORY) < 2:
             return go.Figure().update_layout(template="plotly_dark", title="Collecting data...")
         
-        # Get all unique price levels
-        all_prices = set()
-        for snapshot in BOOKMAP_HISTORY:
-            all_prices.update(snapshot["bids"].keys())
-            all_prices.update(snapshot["asks"].keys())
+        # Focus on ACTIVE trading range (near current price), not full order book depth
+        if bids and asks:
+            # Use best bid/ask (top of book) as reference
+            best_bid = bids[0][0]
+            best_ask = asks[0][0]
+            mid_price = (best_bid + best_ask) / 2
+            
+            # Show ±2% around mid price (adjustable range)
+            price_range_pct = 0.02  # 2% above and below
+            min_bid_price = mid_price * (1 - price_range_pct)
+            max_ask_price = mid_price * (1 + price_range_pct)
+        else:
+            return go.Figure().update_layout(template="plotly_dark")
         
-        all_prices = sorted(all_prices)
+        # Create ALL price levels between min and max
+        all_prices = []
+        p = round(min_bid_price / bucket_size) * bucket_size
+        while p <= max_ask_price:
+            all_prices.append(round(p, 2))
+            p += bucket_size
         
         if not all_prices:
             return go.Figure().update_layout(template="plotly_dark")
@@ -106,10 +132,6 @@ def register_callbacks(app):
         # Apply log scale for better visualization
         liquidity_log = np.log1p(liquidity_matrix)
         
-        # Create time labels (seconds ago)
-        time_labels = [f"-{num_times - i}s" for i in range(num_times)]
-        price_labels = [f"${p:.2f}" for p in all_prices]
-        
         fig = go.Figure()
         
         # Add liquidity heatmap
@@ -118,74 +140,63 @@ def register_callbacks(app):
             x=list(range(num_times)),
             y=all_prices,
             colorscale=[
-                [0.0, 'rgb(0, 20, 40)'],      # Dark blue (low liquidity)
+                [0.0, 'rgb(0, 20, 40)'],      # Dark blue (low/no liquidity)
                 [0.3, 'rgb(0, 100, 150)'],    # Medium blue
                 [0.6, 'rgb(100, 200, 255)'],  # Light blue
                 [0.8, 'rgb(255, 200, 0)'],    # Yellow (high liquidity)
                 [1.0, 'rgb(255, 100, 0)']     # Orange (very high)
             ],
             showscale=False,
-            hovertemplate='Time: %{x}<br>Price: $%{y:.2f}<br>Liquidity: %{z:.1f}<extra></extra>',
+            hovertemplate='Time: %{x}<br>Price: $%{y:.2f}<br>Liquidity: %{customdata:.0f}<extra></extra>',
+            customdata=liquidity_matrix,
             opacity=0.8
         ))
         
-        # Add price line overlay (actual trades)
-        if len(PRICE_TRADES) > 1:
-            trade_times = [t for t, p in PRICE_TRADES]
-            trade_prices = [p for t, p in PRICE_TRADES]
-            
-            # Map timestamps to x-axis indices
+        # Add trade markers (ONLY where actual trades occurred)
+        if len(ACTUAL_TRADES) > 0 and len(timestamps) > 0:
             min_time = timestamps[0]
-            x_indices = []
-            for t in trade_times:
-                if min_time <= t <= timestamps[-1]:
-                    # Find closest time index
+            max_time = timestamps[-1]
+            
+            # Filter trades within our time window
+            valid_trades = []
+            for t, price, volume, side in ACTUAL_TRADES:
+                if min_time <= t <= max_time:
+                    # Map timestamp to x-axis index
                     closest_idx = min(range(len(timestamps)), 
                                     key=lambda i: abs(timestamps[i] - t))
-                    x_indices.append(closest_idx)
-                else:
-                    x_indices.append(None)
+                    valid_trades.append((closest_idx, price, volume, side))
             
-            # Filter out None values
-            valid_points = [(x, p) for x, p in zip(x_indices, trade_prices) if x is not None]
-            
-            if valid_points:
-                x_vals, y_vals = zip(*valid_points)
+            if valid_trades:
+                x_vals, y_vals, volumes, sides = zip(*valid_trades)
                 
-                # Determine colors based on price movement
-                colors = []
-                for i in range(len(y_vals)):
-                    if i == 0:
-                        colors.append('white')
-                    else:
-                        if y_vals[i] > y_vals[i-1]:
-                            colors.append('lime')  # Price up
-                        elif y_vals[i] < y_vals[i-1]:
-                            colors.append('red')   # Price down
-                        else:
-                            colors.append('white') # No change
+                # Calculate marker sizes based on volume (min 5, max 30)
+                if max(volumes) > 0:
+                    min_size = 5
+                    max_size = 30
+                    log_volumes = [np.log1p(v) for v in volumes]
+                    max_log = max(log_volumes) if max(log_volumes) > 0 else 1
+                    sizes = [min_size + (lv / max_log) * (max_size - min_size) for lv in log_volumes]
+                else:
+                    sizes = [8] * len(volumes)
+                
+                # Color based on trade side (buy=green, sell=red)
+                colors = ['lime' if s == 'buy' else 'red' for s in sides]
                 
                 fig.add_trace(go.Scatter(
                     x=x_vals,
                     y=y_vals,
-                    mode='markers+lines',
+                    mode='markers',  # ONLY markers, no lines
                     marker=dict(
-                        size=6,
+                        size=sizes,
                         color=colors,
-                        line=dict(color='white', width=1)
+                        line=dict(color='white', width=1),
+                        opacity=0.9
                     ),
-                    line=dict(color='rgba(255, 255, 255, 0.3)', width=1),
-                    name='Price',
+                    name='Trades',
                     showlegend=False,
-                    hovertemplate='Price: $%{y:.2f}<extra></extra>'
+                    customdata=list(zip(volumes, sides)),
+                    hovertemplate='Price: $%{y:.2f}<br>Volume: %{customdata[0]:.2f}<br>Side: %{customdata[1]}<extra></extra>'
                 ))
-        
-        # Calculate volume bars (aggregated trades per time bucket)
-        volume_bars = []
-        for snapshot in BOOKMAP_HISTORY:
-            # Use trade volume from last second (approximate)
-            total_vol = sum(snapshot["bids"].values()) + sum(snapshot["asks"].values())
-            volume_bars.append(total_vol / 100)  # Scale down for display
         
         fig.update_layout(
             template="plotly_dark",
@@ -197,7 +208,7 @@ def register_callbacks(app):
                 showticklabels=True,
                 tickmode='linear',
                 tick0=0,
-                dtick=30,  # Tick every 30 seconds
+                dtick=30,
                 ticktext=[f"-{num_times - i}s" for i in range(0, num_times, 30)],
                 tickvals=list(range(0, num_times, 30))
             ),
@@ -205,7 +216,8 @@ def register_callbacks(app):
                 title="Price",
                 showgrid=True,
                 gridcolor='rgba(255, 255, 255, 0.1)',
-                tickformat='$.2f'
+                tickformat='$.2f',
+                autorange=True  # Auto-adjust to show full range
             ),
             plot_bgcolor='black',
             hovermode='closest'
