@@ -1,1 +1,1 @@
-# futures_dash
+![](img/dashboard.gif)
