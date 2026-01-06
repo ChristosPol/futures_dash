@@ -66,6 +66,11 @@ def register_callbacks(app):
             # Update last trade time to the most recent
             LAST_TRADE_TIME = max(t["time"] for t in ws.LAST_TRADES)
         
+        # Clean up old trades (older than 300 seconds)
+        cutoff_time = current_time - 300
+        while ACTUAL_TRADES and ACTUAL_TRADES[0][0] < cutoff_time:
+            ACTUAL_TRADES.popleft()
+        
         # Aggregate order book into price buckets
         bucket_size = 0.25
         bid_dict = {}
