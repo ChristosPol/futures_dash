@@ -33,6 +33,9 @@ FLASH_DECAY = 0.85
 CVD = 0.0
 LAST_TRADES = []
 
+# ---- Bookmap trades (Panel 3) - keeps 5 minutes of trades ----
+BOOKMAP_TRADES = deque(maxlen=5000)  # Store all trades for bookmap
+
 TRADE_TIMESTAMPS = []
 BUY_TIMESTAMPS = []
 SELL_TIMESTAMPS = []
@@ -201,6 +204,14 @@ def _update_price_bucket(price: float, volume: float, side: str):
         "time": ts_now
     })
     LAST_TRADES[:] = LAST_TRADES[-20:]
+    
+    # Add to bookmap trades buffer (keeps more trades for Panel 3)
+    BOOKMAP_TRADES.append({
+        "price": price,
+        "volume": volume,
+        "side": side,
+        "time": ts_now
+    })
 
     TRADE_TIMESTAMPS.append(ts_now)
     if side == "buy":

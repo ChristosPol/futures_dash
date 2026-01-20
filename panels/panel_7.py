@@ -17,17 +17,14 @@ OHLC_CACHE = {
 
 UPDATE_INTERVAL = 3600  # Update every hour (3600 seconds)
 
-# Kraken available intervals: 1, 5, 15, 30, 60, 240, 1440, 10080, 21600
-# Minutes:                    1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 15d
+# Kraken available intervals: 1, 5, 15, 30, 60
+# Minutes:                    1m, 5m, 15m, 30m, 1h
 TIMEFRAMES = {
     "1m": {"interval": 1, "label": "1 Min"},
     "5m": {"interval": 5, "label": "5 Min"},
     "15m": {"interval": 15, "label": "15 Min"},
     "30m": {"interval": 30, "label": "30 Min"},
     "1H": {"interval": 60, "label": "1 Hour"},
-    "4H": {"interval": 240, "label": "4 Hour"},
-    "1D": {"interval": 1440, "label": "1 Day"},
-    "1W": {"interval": 10080, "label": "1 Week"},
 }
 
 
@@ -178,7 +175,7 @@ def register_callbacks(app):
         max_price = max(all_prices) * 1.02
         
         # Order timeframes from shortest to longest
-        tf_order = ["1m", "5m", "15m", "30m", "1H", "4H", "1D", "1W"]
+        tf_order = ["1m", "5m", "15m", "30m", "1H"]
         available_tfs = [tf for tf in tf_order if tf in levels]
         
         # X-axis categories
